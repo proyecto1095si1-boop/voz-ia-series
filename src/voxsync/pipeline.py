@@ -1,10 +1,11 @@
 """
 Pipeline principal de VoxSync.
-Orquesta: descarga → audio → transcripción + diarización → atributos → traducción → exportación.
+Orquesta: descarga → audio → transcripción + diarización → atributos →
+traducción → post-procesado (hilo de conversación) → exportación.
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
@@ -14,6 +15,7 @@ from voxsync.audio import extract_audio
 from voxsync.transcriber import transcribe_and_diarize
 from voxsync.speaker_attrs import enrich_speakers
 from voxsync.translator import translate_segments
+from voxsync.postprocess import smooth_conversation
 from voxsync.formatter import export_results
 
 console = Console()
@@ -75,7 +77,12 @@ def run_pipeline(
         segments = translate_segments(segments, source_lang=source_lang, target_lang=target_lang)
         progress.update(task, completed=True)
 
-        # 6. Exportar resultados
+        # 6. Post-procesado: mantener hilo de conversación
+        task = progress.add_task("Suavizando diálogos y uniendo segmentos...", total=None)
+        segments = smooth_conversation(segments)
+        progress.update(task, completed=True)
+
+        # 7. Exportar resultados
         task = progress.add_task("Generando archivos de salida...", total=None)
         results = export_results(
             segments=segments,
@@ -94,4 +101,5 @@ def run_pipeline(
             pass
 
     results["output_dir"] = str(output_dir)
+    results["segments_count"] = len(segments)
     return results

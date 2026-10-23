@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxsync"
+version = "0.1.0"
+description = "Transcripción, diarización y traducción profesional de diálogos · 100% local"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+authors = [
+    {name = "VoxSync Team"}
+]
+keywords = ["transcription", "diarization", "translation", "subtitles", "whisper", "local-ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Multimedia :: Video",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "numpy>=1.24.0",
+    "yt-dlp>=2024.1.0",
+    "ffmpeg-python>=0.2.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "faster-whisper>=1.0.0",
+    "whisperx>=3.1.0",
+    "pyannote.audio>=3.1.0",
+    "transformers>=4.40.0",
+    "sentencepiece>=0.2.0",
+    "typer[all]>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.6.0",
+    "tqdm>=4.66.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+voxsync = "voxsync.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,5 +1,5 @@
-# VoxSync Colab pipeline v2
-# Demucs fondo + TTS fluido + voces consistentes + video copy + JSON meta
+# VoxSync Colab pipeline v3
+# Diarizacion pyannote (si HF_TOKEN) + 1 voz fija por hablante + Demucs + TTS fluido
 
 YOUTUBE_URL = ""
 SOURCE_LANG = "en"
@@ -12,18 +12,23 @@ BURN_SUBTITLES = False
 DUCK_BACKGROUND = 0.30
 TTS_GAIN = 0.95
 CROSSFADE_MS = 45
-SMOOTH_VOICE_WINDOW = 5
+USE_DIARIZATION = True
 
-VOICE_FEMALE = "es-MX-DaliaNeural"
-VOICE_MALE = "es-MX-JorgeNeural"
-VOICE_SENIOR_M = "es-ES-AlvaroNeural"
-VOICE_SENIOR_F = "es-ES-ElviraNeural"
-VOICE_CHILD = "es-MX-DaliaNeural"
+VOICE_POOL = {
+    "adult_female": ["es-MX-DaliaNeural", "es-ES-ElviraNeural", "es-AR-ElenaNeural"],
+    "adult_male": ["es-MX-JorgeNeural", "es-ES-AlvaroNeural", "es-AR-TomasNeural"],
+    "senior_male": ["es-ES-AlvaroNeural"],
+    "senior_female": ["es-ES-ElviraNeural"],
+    "child": ["es-MX-DaliaNeural"],
+}
 
+import os
 import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
     "openai-whisper", "yt-dlp", "transformers>=4.40,<5", "sentencepiece",
     "sacremoses", "edge-tts", "librosa", "soundfile", "demucs"])
+if USE_DIARIZATION:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pyannote.audio"])
 subprocess.run(["apt", "-y", "-qq", "install", "ffmpeg"], check=False)
 
 from pathlib import Path
@@ -36,7 +41,7 @@ import torch
 import librosa
 import soundfile as sf
 import edge_tts
-from collections import Counter
+from collections import Counter, defaultdict
 from transformers import MarianMTModel, MarianTokenizer
 
 work = Path("/content/voxsync")
@@ -68,11 +73,54 @@ subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s1
 subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000",
                 str(audio_16k)], check=True, capture_output=True)
 
-print("Transcribiendo con", WHISPER_MODEL, "...")
+print("Transcribiendo...")
 model = whisper.load_model(WHISPER_MODEL)
 result = model.transcribe(str(audio_16k), language=SOURCE_LANG or None, verbose=False)
 segments = result["segments"]
 print(len(segments), "segmentos")
+
+def run_diarization(wav_path):
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        print("Sin HF_TOKEN: diarizacion desactivada")
+        return None
+    try:
+        from pyannote.audio import Pipeline
+        print("Diarizando con pyannote...")
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=token,
+        )
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+        diar = pipeline(str(wav_path))
+        turns = []
+        for turn, _, speaker in diar.itertracks(yield_label=True):
+            turns.append({"start": float(turn.start), "end": float(turn.end), "speaker": speaker})
+        print("  hablantes:", sorted(set(t["speaker"] for t in turns)))
+        return turns
+    except Exception as e:
+        print("Diarizacion fallo:", e)
+        return None
+
+diar_turns = run_diarization(audio_16k) if USE_DIARIZATION else None
+
+def assign_speaker(seg, turns):
+    if not turns:
+        return "SPEAKER_00"
+    mid = (float(seg["start"]) + float(seg["end"])) / 2.0
+    best, best_ov = None, 0.0
+    for t in turns:
+        ov = max(0.0, min(seg["end"], t["end"]) - max(seg["start"], t["start"]))
+        if ov > best_ov:
+            best_ov = ov
+            best = t["speaker"]
+        if t["start"] <= mid <= t["end"]:
+            return t["speaker"]
+    return best or "SPEAKER_00"
+
+for seg in segments:
+    seg["speaker"] = assign_speaker(seg, diar_turns)
 
 model_name = "Helsinki-NLP/opus-mt-en-es"
 if SOURCE_LANG == "es" and TARGET_LANG == "en":
@@ -129,26 +177,35 @@ def classify_voice(start, end):
         return "adult_male", med
     return "senior_male", med
 
-raw_labels = []
 for seg in segments:
     lab, med = classify_voice(seg["start"], seg["end"])
-    raw_labels.append(lab)
+    seg["voice_type_raw"] = lab
     seg["pitch_hz"] = med
 
-def smooth_labels(labels, window):
-    n = len(labels)
-    out = list(labels)
-    half = max(1, window // 2)
-    for i in range(n):
-        a = max(0, i - half)
-        b = min(n, i + half + 1)
-        out[i] = Counter(labels[a:b]).most_common(1)[0][0]
-    return out
+speaker_types = defaultdict(list)
+for seg in segments:
+    speaker_types[seg["speaker"]].append(seg["voice_type_raw"])
 
-smooth = smooth_labels(raw_labels, SMOOTH_VOICE_WINDOW)
-for seg, lab in zip(segments, smooth):
-    seg["voice_type"] = lab
-print("Distribucion suavizada:", Counter(s["voice_type"] for s in segments))
+speaker_voice = {}
+used = set()
+for spk, types in speaker_types.items():
+    vtype = Counter(types).most_common(1)[0][0]
+    pool = list(VOICE_POOL.get(vtype, VOICE_POOL["adult_male"]))
+    choice = None
+    for v in pool:
+        if v not in used:
+            choice = v
+            used.add(v)
+            break
+    if choice is None:
+        choice = pool[0]
+    speaker_voice[spk] = {"voice_type": vtype, "tts_voice": choice}
+    print(f"  {spk} -> {vtype} -> {choice}")
+
+for seg in segments:
+    info = speaker_voice[seg["speaker"]]
+    seg["voice_type"] = info["voice_type"]
+    seg["tts_voice"] = info["tts_voice"]
 
 bg_path = work / "background.wav"
 if DUB_AUDIO and KEEP_BACKGROUND:
@@ -168,16 +225,14 @@ elif DUB_AUDIO:
     duration = float(_json.loads(probe.stdout)["format"]["duration"])
     sf.write(str(bg_path), np.zeros((int(duration * 44100), 2), dtype=np.float32), 44100)
 
-def pick_voice(voice_type):
-    if voice_type == "adult_female":
-        return VOICE_FEMALE, "+0Hz", "+0%"
-    if voice_type == "child":
-        return VOICE_CHILD, "+18Hz", "+10%"
-    if voice_type == "senior_male":
-        return VOICE_SENIOR_M, "-22Hz", "-8%"
-    if voice_type == "senior_female":
-        return VOICE_SENIOR_F, "-12Hz", "-5%"
-    return VOICE_MALE, "+0Hz", "+0%"
+def pitch_rate_for(vtype):
+    if vtype == "child":
+        return "+18Hz", "+10%"
+    if vtype == "senior_male":
+        return "-22Hz", "-8%"
+    if vtype == "senior_female":
+        return "-12Hz", "-5%"
+    return "+0Hz", "+0%"
 
 async def synth_one(text, out_mp3, voice, rate, pitch):
     text = (text or "").strip()
@@ -209,11 +264,12 @@ dub_path = None
 if DUB_AUDIO:
     tts_dir = work / "tts_segs"
     tts_dir.mkdir(exist_ok=True)
-    print("TTS + ajuste de duracion...")
+    print("TTS (1 voz fija por hablante)...")
 
     async def run_tts():
         for i, seg in enumerate(segments):
-            voice, pitch, rate = pick_voice(seg.get("voice_type", "adult_male"))
+            voice = seg.get("tts_voice") or VOICE_POOL["adult_male"][0]
+            pitch, rate = pitch_rate_for(seg.get("voice_type", "adult_male"))
             mp3 = tts_dir / f"seg_{i:04d}.mp3"
             wav_raw = tts_dir / f"seg_{i:04d}_raw.wav"
             wav_fit = tts_dir / f"seg_{i:04d}_fit.wav"
@@ -225,7 +281,6 @@ if DUB_AUDIO:
                            check=True, capture_output=True)
             fit_to_duration(wav_raw, wav_fit, max(0.08, float(seg["end"] - seg["start"])), 44100)
             seg["tts_fit"] = str(wav_fit)
-            seg["tts_voice"] = voice
             if (i + 1) % 20 == 0:
                 print(f"  TTS {i+1}/{len(segments)}")
 
@@ -238,7 +293,7 @@ if DUB_AUDIO:
     if bg.ndim == 1:
         bg = np.stack([bg, bg], axis=1)
     mix = bg.astype(np.float32).copy()
-    for i, seg in enumerate(segments):
+    for seg in segments:
         path = seg.get("tts_fit")
         if not path or not Path(path).exists():
             continue
@@ -273,16 +328,15 @@ srt_path = work / f"{base}.es.srt"
 with open(srt_path, "w", encoding="utf-8") as f:
     for i, seg in enumerate(segments, 1):
         text = (seg.get("translation") or seg["text"]).strip()
-        f.write(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n{text}\n\n")
+        spk = seg.get("speaker", "")
+        f.write(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n[{spk}] {text}\n\n")
 
 json_path = work / f"{base}.meta.json"
 meta = {
-    "source_lang": SOURCE_LANG,
-    "target_lang": TARGET_LANG,
-    "whisper_model": WHISPER_MODEL,
+    "speakers": speaker_voice,
     "segments": [
         {
-            "start": s["start"], "end": s["end"],
+            "start": s["start"], "end": s["end"], "speaker": s.get("speaker"),
             "text": s.get("text"), "translation": s.get("translation"),
             "voice_type": s.get("voice_type"), "tts_voice": s.get("tts_voice"),
             "pitch_hz": s.get("pitch_hz"),
@@ -306,7 +360,7 @@ else:
     cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input,
            "-map", "0:v:0", "-map", "1:a:0",
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
-print("Renderizando video...")
+print("Renderizando...")
 subprocess.run(cmd, check=True, capture_output=True)
 print("Video:", out_video)
 
@@ -316,4 +370,4 @@ files.download(str(out_video))
 files.download(str(json_path))
 if dub_path:
     files.download(str(dub_path))
-print("Listo v2: fondo + voces consistentes + video calidad original")
+print("Listo v3: diarizacion + 1 voz fija por persona")

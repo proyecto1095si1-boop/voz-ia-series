@@ -1,9 +1,9 @@
-# Ejemplo de uso básico de VoxSync
+# Ejemplos de uso de VoxSync
 
 ## 1. Procesar un video de YouTube (inglés → español)
 
 ```bash
-voxsync process "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+voxsync process "https://www.youtube.com/watch?v=XXXX" \
   --source-lang en \
   --target-lang es \
   --output ./resultados/demo
@@ -31,6 +31,17 @@ voxsync process "./video_corto.mp4" --model small --device cpu
 voxsync process "./entrevista.mp4" -s es -t en
 ```
 
+## 5. Procesar una carpeta completa (modo lote / serie entera)
+
+```bash
+# Procesa todos los videos de una carpeta (y subcarpetas)
+voxsync batch "./series/TheOffice/Season01" \
+  -o "./subtitulos/TheOffice/S01" \
+  -s en \
+  -t es \
+  --model large-v3
+```
+
 ## Resultado esperado
 
 Después de ejecutar el comando, en la carpeta de salida encontrarás:
@@ -54,3 +65,5 @@ resultados/demo/
   Original : I'm good, thanks. What about you?
   Traducido: Estoy bien, gracias. ¿Y tú?
 ```
+
+Los segmentos del mismo hablante que están muy juntos se unen automáticamente para mantener el hilo de la conversación.

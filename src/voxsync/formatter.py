@@ -30,9 +30,14 @@ def _speaker_label(seg: Dict[str, Any]) -> str:
     gender = seg.get("gender", "unknown")
     age = seg.get("age_group", "unknown")
 
-    gender_map = {"male": "Hombre", "female": "Mujer", "unknown": "?"}
+    gender_map = {
+        "male": "Hombre",
+        "female": "Mujer",
+        "unknown": "?",
+    }
     age_map = {
         "child": "Niño/a",
+        "teen": "Adolescente",
         "adult": "Adulto",
         "senior": "Mayor",
         "unknown": "?",
@@ -109,8 +114,17 @@ def export_results(
             label = _speaker_label(seg)
             original = seg["text"]
             translated = seg.get("translation", "")
+            g_conf = seg.get("gender_confidence")
+            a_conf = seg.get("age_confidence")
 
             f.write(f"[{start}] {label}\n")
+            if g_conf is not None or a_conf is not None:
+                conf_parts = []
+                if g_conf is not None:
+                    conf_parts.append(f"género {g_conf:.0%}")
+                if a_conf is not None:
+                    conf_parts.append(f"edad {a_conf:.0%}")
+                f.write(f"  Confianza : {", ".join(conf_parts)}\n")
             f.write(f"  Original : {original}\n")
             if translated and translated != original:
                 f.write(f"  Traducido: {translated}\n")

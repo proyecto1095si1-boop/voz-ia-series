@@ -19,17 +19,17 @@ transformers>=4.40.0
 sentencepiece>=0.2.0
 sacremoses>=0.1.0
 
-# Speaker attributes (gender / age approximation)
-# Models will be loaded from Hugging Face
+# Speaker attributes (gender model + acoustic features)
+# Gender model: alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech
 
 # CLI & UX
 typer[all]>=0.12.0
 rich>=13.7.0
 
+# GUI
+gradio>=4.0.0
+
 # Utils
 pydantic>=2.6.0
 tqdm>=4.66.0
 python-dotenv>=1.0.0
-
-# Optional (for future GUI)
-# gradio>=4.0.0

@@ -33,44 +33,25 @@ def _print_banner() -> None:
 
 @app.command("process")
 def process(
-    input_path: str = typer.Argument(
-        ...,
-        help="Ruta a un video/audio local o URL de YouTube",
-    ),
-    output_dir: Path = typer.Option(
-        Path("output"),
-        "--output", "-o",
-        help="Carpeta donde se guardarán los resultados",
-    ),
-    source_lang: str = typer.Option(
-        "en",
-        "--source-lang", "-s",
-        help="Idioma de origen (código ISO, ej: en, es, fr)",
-    ),
-    target_lang: str = typer.Option(
-        "es",
-        "--target-lang", "-t",
-        help="Idioma de destino (código ISO)",
-    ),
-    model_size: str = typer.Option(
-        "large-v3",
-        "--model",
-        help="Tamaño del modelo Whisper (tiny, base, small, medium, large-v2, large-v3)",
-    ),
-    device: str = typer.Option(
-        "auto",
-        "--device",
-        help="Dispositivo: auto, cpu, cuda",
-    ),
-    keep_audio: bool = typer.Option(
+    input_path: str = typer.Argument(..., help="Video/audio local o URL de YouTube"),
+    output_dir: Path = typer.Option(Path("output"), "--output", "-o"),
+    source_lang: str = typer.Option("en", "--source-lang", "-s"),
+    target_lang: str = typer.Option("es", "--target-lang", "-t"),
+    model_size: str = typer.Option("large-v3", "--model"),
+    device: str = typer.Option("auto", "--device"),
+    keep_audio: bool = typer.Option(False, "--keep-audio"),
+    bilingual: bool = typer.Option(
         False,
-        "--keep-audio",
-        help="Conservar el archivo de audio extraído",
+        "--bilingual",
+        help="Subtítulos con original + traducción en cada línea",
+    ),
+    no_speaker: bool = typer.Option(
+        False,
+        "--no-speaker",
+        help="No mostrar etiqueta de hablante en los subtítulos",
     ),
 ):
-    """
-    Procesa un video o audio: transcribe, diariza, detecta atributos de hablantes y traduce.
-    """
+    """Procesa un video o audio: transcribe, diariza, detecta atributos y traduce."""
     _print_banner()
 
     try:
@@ -82,19 +63,21 @@ def process(
             model_size=model_size,
             device=device,
             keep_audio=keep_audio,
+            bilingual=bilingual,
+            show_speaker=not no_speaker,
         )
 
         console.print("\n[bold green]✓ Procesamiento completado[/bold green]")
-        console.print(f"Resultados guardados en: [cyan]{result['output_dir']}[/cyan]")
-
-        if result.get("srt_path"):
-            console.print(f"  • Subtítulos SRT : {result['srt_path']}")
-        if result.get("vtt_path"):
-            console.print(f"  • Subtítulos VTT : {result['vtt_path']}")
-        if result.get("json_path"):
-            console.print(f"  • Datos JSON    : {result['json_path']}")
-        if result.get("txt_path"):
-            console.print(f"  • Texto legible : {result['txt_path']}")
+        console.print(f"Resultados en: [cyan]{result['output_dir']}[/cyan]")
+        for key, label in [
+            ("srt_path", "SRT traducido"),
+            ("srt_original_path", "SRT original"),
+            ("vtt_path", "VTT"),
+            ("json_path", "JSON"),
+            ("txt_path", "Guion TXT"),
+        ]:
+            if result.get(key):
+                console.print(f"  • {label}: {result[key]}")
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
@@ -103,31 +86,18 @@ def process(
 
 @app.command("batch")
 def batch(
-    input_folder: Path = typer.Argument(
-        ...,
-        help="Carpeta que contiene los videos/audios a procesar",
-    ),
-    output_folder: Path = typer.Option(
-        Path("output/batch"),
-        "--output", "-o",
-        help="Carpeta raíz donde se guardarán los resultados",
-    ),
+    input_folder: Path = typer.Argument(..., help="Carpeta con videos/audios"),
+    output_folder: Path = typer.Option(Path("output/batch"), "--output", "-o"),
     source_lang: str = typer.Option("en", "--source-lang", "-s"),
     target_lang: str = typer.Option("es", "--target-lang", "-t"),
     model_size: str = typer.Option("large-v3", "--model"),
     device: str = typer.Option("auto", "--device"),
-    recursive: bool = typer.Option(
-        True,
-        "--recursive/--no-recursive",
-        help="Buscar archivos en subcarpetas",
-    ),
+    recursive: bool = typer.Option(True, "--recursive/--no-recursive"),
     keep_audio: bool = typer.Option(False, "--keep-audio"),
 ):
-    """
-    Procesa todos los videos/audios de una carpeta (ideal para series completas).
-    """
+    """Procesa todos los videos/audios de una carpeta (series completas)."""
     _print_banner()
-    console.print(f"[bold]Modo lote[/bold] — Carpeta: [cyan]{input_folder}[/cyan]\n")
+    console.print(f"[bold]Modo lote[/bold] — [cyan]{input_folder}[/cyan]\n")
 
     try:
         summary = process_batch(
@@ -144,11 +114,9 @@ def batch(
         if summary["failed"] == 0 and summary["success"] > 0:
             console.print("\n[bold green]✓ Lote completado sin errores[/bold green]")
         elif summary["success"] > 0:
-            console.print(
-                f"\n[bold yellow]⚠ Lote terminado con {summary['failed']} error(es)[/bold yellow]"
-            )
+            console.print(f"\n[bold yellow]⚠ Terminado con {summary['failed']} error(es)[/bold yellow]")
         else:
-            console.print("\n[bold red]✗ No se pudo procesar ningún archivo[/bold red]")
+            console.print("\n[bold red]✗ No se procesó ningún archivo[/bold red]")
             raise typer.Exit(code=1)
 
     except Exception as e:
@@ -158,31 +126,33 @@ def batch(
 
 @app.command("gui")
 def gui(
-    port: int = typer.Option(7860, "--port", "-p", help="Puerto del servidor web"),
-    share: bool = typer.Option(
-        False,
-        "--share",
-        help="Crear un enlace público temporal (Gradio share)",
-    ),
+    port: int = typer.Option(7860, "--port", "-p"),
+    share: bool = typer.Option(False, "--share", help="Enlace público temporal"),
 ):
-    """
-    Abre la interfaz gráfica web (ideal para usuarios no técnicos).
-    """
+    """Abre la interfaz gráfica web."""
     _print_banner()
-    console.print(f"Iniciando interfaz gráfica en el puerto [cyan]{port}[/cyan]...\n")
+    console.print(f"Iniciando GUI en puerto [cyan]{port}[/cyan]...\n")
 
     try:
         from voxsync.gui import launch
 
         launch(share=share, server_port=port)
     except ImportError:
-        console.print(
-            "[bold red]Gradio no está instalado.[/bold red]\n"
-            "Instalalo con: [cyan]pip install gradio[/cyan]"
-        )
+        console.print("[bold red]Gradio no instalado.[/bold red] pip install gradio")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[bold red]✗ Error al iniciar la GUI:[/bold red] {e}")
+        console.print(f"[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("doctor")
+def doctor():
+    """Diagnostica el sistema (FFmpeg, GPU, modelos, token HF, etc.)."""
+    _print_banner()
+    from voxsync.doctor import run_doctor
+
+    ok = run_doctor()
+    if not ok:
         raise typer.Exit(code=1)
 
 

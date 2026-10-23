@@ -1,0 +1,35 @@
+# Core
+torch>=2.1.0
+torchaudio>=2.1.0
+numpy>=1.24.0
+
+# Audio & video
+yt-dlp>=2024.1.0
+ffmpeg-python>=0.2.0
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Transcription + Diarization
+faster-whisper>=1.0.0
+whisperx>=3.1.0
+pyannote.audio>=3.1.0
+
+# Translation (local)
+transformers>=4.40.0
+sentencepiece>=0.2.0
+sacremoses>=0.1.0
+
+# Speaker attributes (gender / age approximation)
+# Models will be loaded from Hugging Face
+
+# CLI & UX
+typer[all]>=0.12.0
+rich>=13.7.0
+
+# Utils
+pydantic>=2.6.0
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# Optional (for future GUI)
+# gradio>=4.0.0

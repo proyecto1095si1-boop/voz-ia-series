@@ -3,7 +3,6 @@ VoxSync CLI — Interfaz de línea de comandos profesional.
 """
 
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -154,6 +153,36 @@ def batch(
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("gui")
+def gui(
+    port: int = typer.Option(7860, "--port", "-p", help="Puerto del servidor web"),
+    share: bool = typer.Option(
+        False,
+        "--share",
+        help="Crear un enlace público temporal (Gradio share)",
+    ),
+):
+    """
+    Abre la interfaz gráfica web (ideal para usuarios no técnicos).
+    """
+    _print_banner()
+    console.print(f"Iniciando interfaz gráfica en el puerto [cyan]{port}[/cyan]...\n")
+
+    try:
+        from voxsync.gui import launch
+
+        launch(share=share, server_port=port)
+    except ImportError:
+        console.print(
+            "[bold red]Gradio no está instalado.[/bold red]\n"
+            "Instalalo con: [cyan]pip install gradio[/cyan]"
+        )
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error al iniciar la GUI:[/bold red] {e}")
         raise typer.Exit(code=1)
 
 

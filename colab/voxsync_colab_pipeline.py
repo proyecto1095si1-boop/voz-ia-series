@@ -1,19 +1,24 @@
-# VoxSync Colab pipeline - doblaje mejorado
-# Mejoras: Demucs (fondo), TTS estirado, video -c:v copy
+# VoxSync Colab pipeline v2
+# Demucs fondo + TTS fluido + voces consistentes + video copy + JSON meta
 
 YOUTUBE_URL = ""
 SOURCE_LANG = "en"
 TARGET_LANG = "es"
 WHISPER_MODEL = "small"
+
 DUB_AUDIO = True
 KEEP_BACKGROUND = True
 BURN_SUBTITLES = False
-VOICE_FEMALE = "es-ES-ElviraNeural"
-VOICE_MALE = "es-ES-AlvaroNeural"
+DUCK_BACKGROUND = 0.30
+TTS_GAIN = 0.95
+CROSSFADE_MS = 45
+SMOOTH_VOICE_WINDOW = 5
+
+VOICE_FEMALE = "es-MX-DaliaNeural"
+VOICE_MALE = "es-MX-JorgeNeural"
 VOICE_SENIOR_M = "es-ES-AlvaroNeural"
 VOICE_SENIOR_F = "es-ES-ElviraNeural"
-VOICE_CHILD = "es-ES-ElviraNeural"
-CROSSFADE_MS = 40
+VOICE_CHILD = "es-MX-DaliaNeural"
 
 import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
@@ -25,12 +30,12 @@ from pathlib import Path
 import numpy as np
 import json as _json
 import shutil
+import asyncio
 import whisper
 import torch
 import librosa
 import soundfile as sf
 import edge_tts
-import asyncio
 from collections import Counter
 from transformers import MarianMTModel, MarianTokenizer
 
@@ -63,7 +68,7 @@ subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s1
 subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000",
                 str(audio_16k)], check=True, capture_output=True)
 
-print("Transcribiendo...")
+print("Transcribiendo con", WHISPER_MODEL, "...")
 model = whisper.load_model(WHISPER_MODEL)
 result = model.transcribe(str(audio_16k), language=SOURCE_LANG or None, verbose=False)
 segments = result["segments"]
@@ -104,7 +109,7 @@ def classify_voice(start, end):
     i0 = max(0, int(start * sr16))
     i1 = min(len(y16), int(end * sr16))
     if i1 - i0 < sr16 * 0.15:
-        return "adult_male"
+        return "adult_male", 80.0
     chunk = y16[i0:i1]
     try:
         f0, _, _ = librosa.pyin(chunk, fmin=60, fmax=400, sr=sr16)
@@ -112,21 +117,38 @@ def classify_voice(start, end):
     except Exception:
         f0_clean = np.array([])
     if len(f0_clean) < 3:
-        return "adult_male"
+        return "adult_male", 80.0
     med = float(np.median(f0_clean))
     if med >= 220:
-        return "child"
+        return "child", med
     if med >= 165:
-        return "adult_female"
+        return "adult_female", med
     if med >= 135:
-        return "adult_female"
+        return "adult_female", med
     if med >= 95:
-        return "adult_male"
-    return "senior_male"
+        return "adult_male", med
+    return "senior_male", med
 
+raw_labels = []
 for seg in segments:
-    seg["voice_type"] = classify_voice(seg["start"], seg["end"])
-print("Distribucion:", Counter(s["voice_type"] for s in segments))
+    lab, med = classify_voice(seg["start"], seg["end"])
+    raw_labels.append(lab)
+    seg["pitch_hz"] = med
+
+def smooth_labels(labels, window):
+    n = len(labels)
+    out = list(labels)
+    half = max(1, window // 2)
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n, i + half + 1)
+        out[i] = Counter(labels[a:b]).most_common(1)[0][0]
+    return out
+
+smooth = smooth_labels(raw_labels, SMOOTH_VOICE_WINDOW)
+for seg, lab in zip(segments, smooth):
+    seg["voice_type"] = lab
+print("Distribucion suavizada:", Counter(s["voice_type"] for s in segments))
 
 bg_path = work / "background.wav"
 if DUB_AUDIO and KEEP_BACKGROUND:
@@ -140,7 +162,6 @@ if DUB_AUDIO and KEEP_BACKGROUND:
     if not found_bg:
         raise RuntimeError("Demucs no genero no_vocals.wav")
     shutil.copy(found_bg[0], bg_path)
-    print("Fondo:", bg_path)
 elif DUB_AUDIO:
     probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
                             str(video_path)], capture_output=True, text=True, check=True)
@@ -151,11 +172,11 @@ def pick_voice(voice_type):
     if voice_type == "adult_female":
         return VOICE_FEMALE, "+0Hz", "+0%"
     if voice_type == "child":
-        return VOICE_CHILD, "+15Hz", "+8%"
+        return VOICE_CHILD, "+18Hz", "+10%"
     if voice_type == "senior_male":
-        return VOICE_SENIOR_M, "-20Hz", "-6%"
+        return VOICE_SENIOR_M, "-22Hz", "-8%"
     if voice_type == "senior_female":
-        return VOICE_SENIOR_F, "-12Hz", "-4%"
+        return VOICE_SENIOR_F, "-12Hz", "-5%"
     return VOICE_MALE, "+0Hz", "+0%"
 
 async def synth_one(text, out_mp3, voice, rate, pitch):
@@ -171,14 +192,14 @@ def fit_to_duration(wav_in, wav_out, target_sec, sr=44100):
         sf.write(str(wav_out), y, sr)
         return
     cur = len(y) / sr
-    rate = float(np.clip(cur / target_sec, 0.7, 1.45))
+    rate = float(np.clip(cur / target_sec, 0.72, 1.40))
     y2 = librosa.effects.time_stretch(y, rate=rate)
     n = int(target_sec * sr)
     if len(y2) > n:
         y2 = y2[:n]
     else:
         y2 = np.pad(y2, (0, n - len(y2)))
-    fade = min(int(sr * CROSSFADE_MS / 1000), len(y2) // 4)
+    fade = min(int(sr * CROSSFADE_MS / 1000), max(2, len(y2) // 4))
     if fade > 2:
         y2[:fade] *= np.linspace(0, 1, fade)
         y2[-fade:] *= np.linspace(1, 0, fade)
@@ -204,6 +225,7 @@ if DUB_AUDIO:
                            check=True, capture_output=True)
             fit_to_duration(wav_raw, wav_fit, max(0.08, float(seg["end"] - seg["start"])), 44100)
             seg["tts_fit"] = str(wav_fit)
+            seg["tts_voice"] = voice
             if (i + 1) % 20 == 0:
                 print(f"  TTS {i+1}/{len(segments)}")
 
@@ -230,8 +252,8 @@ if DUB_AUDIO:
             continue
         voice = voice[: end - start]
         stereo = np.stack([voice, voice], axis=1)
-        mix[start:end] *= 0.35
-        mix[start:end] += stereo * 0.95
+        mix[start:end] *= float(DUCK_BACKGROUND)
+        mix[start:end] += stereo * float(TTS_GAIN)
     peak = np.max(np.abs(mix)) + 1e-8
     if peak > 0.99:
         mix *= 0.99 / peak
@@ -253,6 +275,24 @@ with open(srt_path, "w", encoding="utf-8") as f:
         text = (seg.get("translation") or seg["text"]).strip()
         f.write(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n{text}\n\n")
 
+json_path = work / f"{base}.meta.json"
+meta = {
+    "source_lang": SOURCE_LANG,
+    "target_lang": TARGET_LANG,
+    "whisper_model": WHISPER_MODEL,
+    "segments": [
+        {
+            "start": s["start"], "end": s["end"],
+            "text": s.get("text"), "translation": s.get("translation"),
+            "voice_type": s.get("voice_type"), "tts_voice": s.get("tts_voice"),
+            "pitch_hz": s.get("pitch_hz"),
+        }
+        for s in segments
+    ],
+}
+with open(json_path, "w", encoding="utf-8") as f:
+    _json.dump(meta, f, ensure_ascii=False, indent=2)
+
 out_video = work / f"{base}_ES_DOBLADO.mp4"
 audio_input = str(dub_path) if dub_path else str(audio_path)
 if BURN_SUBTITLES:
@@ -266,13 +306,14 @@ else:
     cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input,
            "-map", "0:v:0", "-map", "1:a:0",
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
-print("Renderizando...")
+print("Renderizando video...")
 subprocess.run(cmd, check=True, capture_output=True)
 print("Video:", out_video)
 
 from google.colab import files
 files.download(str(srt_path))
 files.download(str(out_video))
+files.download(str(json_path))
 if dub_path:
     files.download(str(dub_path))
-print("Listo: fondo conservado + voces fluidas + video sin recomprimir")
+print("Listo v2: fondo + voces consistentes + video calidad original")

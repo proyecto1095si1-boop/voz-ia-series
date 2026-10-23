@@ -20,12 +20,14 @@ VoxSync es una herramienta de grado profesional diseñada para canales de YouTub
 - **100% local** — Sin APIs de pago. Todo corre en tu máquina.
 - Transcripción de alta calidad con **WhisperX**
 - **Diarización de hablantes** (quién habla y cuándo)
-- Detección aproximada de **género** y **rango de edad** (niño/niña, adulto, persona mayor)
+- Detección de **género** (modelo ML) y **edad** (niño / adolescente / adulto / mayor)
 - Traducción de calidad profesional (inglés ↔ español y otros idiomas) con modelos locales
-- Mantiene el **hilo cronológico** de la conversación
+- Mantiene el **hilo cronológico** de la conversación (une segmentos del mismo hablante)
 - Soporte para videos locales y enlaces de YouTube
-- Exportación en formatos estándar: **SRT**, **VTT**, **JSON** y texto legible
-- Diseñado para ser empaquetado y vendido como producto profesional
+- **Modo lote** para series completas
+- **Interfaz gráfica** (Gradio) para usuarios no técnicos
+- Exportación: **SRT**, **VTT**, **JSON** y texto legible
+- Diseñado para empaquetarse y venderse como producto profesional
 
 ---
 
@@ -34,7 +36,7 @@ VoxSync es una herramienta de grado profesional diseñada para canales de YouTub
 - Python **3.10+**
 - **FFmpeg** instalado y disponible en el PATH
 - GPU con CUDA recomendada (funciona también en CPU)
-- 8–16 GB de RAM (según el modelo de Whisper que uses)
+- 8–16 GB de RAM (según el modelo de Whisper)
 - Cuenta gratuita en Hugging Face (necesaria para la diarización con pyannote)
 
 ---
@@ -71,46 +73,55 @@ export HF_TOKEN="tu_token_aqui"   # Linux/macOS
 
 ---
 
-## 💬 Uso básico
+## 💬 Uso
+
+### Interfaz gráfica (recomendado para no técnicos)
 
 ```bash
-# Procesar un video de YouTube
-voxsync process "https://www.youtube.com/watch?v=XXXX" --source-lang en --target-lang es
+voxsync gui
+# Abre http://127.0.0.1:7860 en el navegador
+```
 
-# Procesar un archivo local
+Opciones:
+
+```bash
+voxsync gui --port 8080          # otro puerto
+voxsync gui --share              # enlace público temporal
+```
+
+### Un video / YouTube
+
+```bash
+voxsync process "https://www.youtube.com/watch?v=XXXX" -s en -t es
 voxsync process "./episodio01.mp4" -s en -t es -o ./resultados
+voxsync process "./video.mp4" --model medium --device cpu
+```
 
-# Usar un modelo más ligero (más rápido, menos preciso)
-voxsync process "./video.mp4" --model medium
+### Serie completa (modo lote)
 
-# Forzar CPU
-voxsync process "./video.mp4" --device cpu
-
-# Conservar el audio extraído
-voxsync process "./video.mp4" --keep-audio
+```bash
+voxsync batch "./series/Season01" -o "./subtitulos/S01" -s en -t es
 ```
 
 ### Opciones principales
 
-| Opción              | Descripción                              | Default     |
-|---------------------|------------------------------------------|-------------|
-| `--source-lang` / `-s` | Idioma de origen                       | `en`        |
-| `--target-lang` / `-t` | Idioma de destino                      | `es`        |
-| `--model`           | Tamaño del modelo Whisper                | `large-v3`  |
-| `--device`          | `auto`, `cpu` o `cuda`                   | `auto`      |
-| `--output` / `-o`   | Carpeta de salida                        | `output`    |
-| `--keep-audio`      | Conservar el WAV extraído                | `False`     |
+| Opción | Descripción | Default |
+|--------|-------------|--------|
+| `--source-lang` / `-s` | Idioma de origen | `en` |
+| `--target-lang` / `-t` | Idioma de destino | `es` |
+| `--model` | Tamaño Whisper | `large-v3` |
+| `--device` | `auto`, `cpu` o `cuda` | `auto` |
+| `--output` / `-o` | Carpeta de salida | `output` |
+| `--keep-audio` | Conservar el WAV | `False` |
 
 ---
 
 ## 📂 Archivos de salida
 
-Después de procesar un video, VoxSync genera:
-
-- `nombre.es.srt`     → Subtítulos en formato SRT (traducidos)
-- `nombre.es.vtt`     → Subtítulos en formato WebVTT
-- `nombre.json`       → Datos completos (timestamps, hablantes, género, edad, texto original y traducción)
-- `nombre.txt`        → Guion legible con hablantes y diálogos
+- `nombre.es.srt` — Subtítulos SRT (traducidos)
+- `nombre.es.vtt` — Subtítulos WebVTT
+- `nombre.json` — Datos completos (timestamps, hablantes, género, edad, confianza, texto)
+- `nombre.txt` — Guion legible con hablantes y diálogos
 
 ---
 
@@ -122,20 +133,20 @@ voxsync/
 ├── requirements.txt
 ├── pyproject.toml
 ├── .gitignore
-├── src/
-│   └── voxsync/
-│       ├── __init__.py
-│       ├── cli.py
-│       ├── pipeline.py
-│       ├── downloader.py
-│       ├── audio.py
-│       ├── transcriber.py
-│       ├── speaker_attrs.py
-│       ├── translator.py
-│       ├── formatter.py
-│       └── config.py
-├── examples/
-└── models/              # Se crean automáticamente
+├── src/voxsync/
+│   ├── cli.py              # process | batch | gui | version
+│   ├── gui.py              # Interfaz Gradio
+│   ├── pipeline.py
+│   ├── batch.py
+│   ├── downloader.py
+│   ├── audio.py
+│   ├── transcriber.py
+│   ├── speaker_attrs.py    # Género (ML) + edad
+│   ├── translator.py
+│   ├── postprocess.py      # Hilo de conversación
+│   ├── formatter.py
+│   └── config.py
+└── examples/
 ```
 
 ---
@@ -145,15 +156,15 @@ voxsync/
 - [x] Nombre comercial y estructura base
 - [x] Pipeline de descarga + extracción de audio
 - [x] Transcripción + diarización con WhisperX
-- [x] Detección de atributos de hablante (género / edad)
+- [x] Detección de género (ML) y edad mejorada
 - [x] Traducción local
+- [x] Post-procesado del hilo de conversación
 - [x] Generación de subtítulos (SRT/VTT)
-- [x] CLI profesional
-- [ ] Mejoras en detección de género/edad (modelos más precisos)
-- [ ] Modo batch (varios episodios)
-- [ ] Interfaz gráfica simple (Gradio)
+- [x] CLI profesional (`process`, `batch`, `gui`)
+- [x] Interfaz gráfica (Gradio)
+- [x] Modo batch (varios episodios)
 - [ ] Empaquetado para distribución (instalador)
-- [ ] Documentación comercial y licencia
+- [ ] Documentación comercial y licencia definitiva
 
 ---
 

@@ -68,8 +68,8 @@ def run_pipeline(
         progress.update(task, completed=True)
 
         # 4. Enriquecer con atributos de hablante (género / edad)
-        task = progress.add_task("Analizando atributos de voz...", total=None)
-        segments = enrich_speakers(segments, audio_path)
+        task = progress.add_task("Analizando atributos de voz (género + edad)...", total=None)
+        segments = enrich_speakers(segments, audio_path, device=device)
         progress.update(task, completed=True)
 
         # 5. Traducir

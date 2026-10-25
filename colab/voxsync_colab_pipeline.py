@@ -1,5 +1,5 @@
-# VoxSync Colab pipeline v4
-# Merge same speaker + batch folder + diarization + Demucs + TTS
+# VoxSync Colab pipeline v4.1
+# Fixes: pyannote token= + nest_asyncio for Colab
 
 YOUTUBE_URL = ""
 INPUT_FOLDER = ""
@@ -29,10 +29,13 @@ VOICE_POOL = {
 import os, subprocess, sys, shutil, asyncio
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
     "openai-whisper", "yt-dlp", "transformers>=4.40,<5", "sentencepiece",
-    "sacremoses", "edge-tts", "librosa", "soundfile", "demucs"])
+    "sacremoses", "edge-tts", "librosa", "soundfile", "demucs", "nest_asyncio"])
 if USE_DIARIZATION:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pyannote.audio"])
 subprocess.run(["apt", "-y", "-qq", "install", "ffmpeg"], check=False)
+
+import nest_asyncio
+nest_asyncio.apply()
 
 from pathlib import Path
 import numpy as np, json as _json, whisper, torch, librosa, soundfile as sf, edge_tts
@@ -92,7 +95,10 @@ def run_diarization(wav_path):
     try:
         from pyannote.audio import Pipeline
         print("  Diarizando...")
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        try:
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+        except TypeError:
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
         diar = pipeline(str(wav_path))
@@ -186,6 +192,13 @@ def ts(seconds):
     h, rem = divmod(total, 3600); m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
 def process_one(video_path, out_root):
     video_path = Path(video_path)
     print("\n==========", video_path.name, "==========")
@@ -211,6 +224,7 @@ def process_one(video_path, out_root):
             out = translate_batch(batch)
             for j, t in enumerate(batch):
                 translations.append(out[j] if t else "")
+            print(f"  trad {min(i+16, len(texts))}/{len(texts)}")
     for seg, tr in zip(segments, translations):
         seg["translation"] = tr
     y16, sr16 = librosa.load(str(audio_16k), sr=16000)
@@ -243,6 +257,7 @@ def process_one(video_path, out_root):
         found_bg = list(demucs_out.rglob("no_vocals.wav"))
         if not found_bg: raise RuntimeError("Demucs fallo")
         shutil.copy(found_bg[0], bg_path)
+        print("  Fondo OK")
     elif DUB_AUDIO:
         probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
                                 str(video_path)], capture_output=True, text=True, check=True)
@@ -251,6 +266,7 @@ def process_one(video_path, out_root):
     dub_path = None
     if DUB_AUDIO:
         tts_dir = ep_dir / "tts_segs"; tts_dir.mkdir(exist_ok=True)
+        print("  TTS...")
         async def run_tts():
             for i, seg in enumerate(segments):
                 voice = seg.get("tts_voice") or VOICE_POOL["adult_male"][0]
@@ -260,14 +276,15 @@ def process_one(video_path, out_root):
                 wav_fit = tts_dir / f"seg_{i:04d}_fit.wav"
                 ok = await synth_one(seg.get("translation") or seg.get("text"), mp3, voice, rate, pitch)
                 if not ok:
-                    seg["tts_fit"] = None; continue
+                    seg["tts_fit"] = None
+                    continue
                 subprocess.run(["ffmpeg", "-y", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(wav_raw)],
                                check=True, capture_output=True)
                 fit_to_duration(wav_raw, wav_fit, max(0.08, float(seg["end"] - seg["start"])), 44100)
                 seg["tts_fit"] = str(wav_fit)
-                if (i + 1) % 15 == 0: print(f"  TTS {i+1}/{len(segments)}")
-        try: asyncio.get_event_loop().run_until_complete(run_tts())
-        except RuntimeError: asyncio.run(run_tts())
+                if (i + 1) % 10 == 0:
+                    print(f"  TTS {i+1}/{len(segments)}")
+        run_async(run_tts())
         bg, sr = sf.read(str(bg_path))
         if bg.ndim == 1: bg = np.stack([bg, bg], axis=1)
         mix = bg.astype(np.float32).copy()
@@ -288,6 +305,7 @@ def process_one(video_path, out_root):
         if peak > 0.99: mix *= 0.99 / peak
         dub_path = ep_dir / "audio_doblado.wav"
         sf.write(str(dub_path), mix, sr)
+        print("  Audio doblado OK")
     base = video_path.stem
     srt_path = ep_dir / f"{base}.es.srt"
     with open(srt_path, "w", encoding="utf-8") as f:
@@ -311,6 +329,7 @@ def process_one(video_path, out_root):
     else:
         cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input, "-map", "0:v:0", "-map", "1:a:0",
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
+    print("  Renderizando video...")
     subprocess.run(cmd, check=True, capture_output=True)
     print("  OK:", out_video)
     return out_video, srt_path, json_path, dub_path
@@ -319,12 +338,16 @@ videos = get_video_list()
 out_root = work / "output"; out_root.mkdir(exist_ok=True)
 results = []
 for vp in videos:
-    try: results.append(process_one(vp, out_root))
-    except Exception as e: print("ERROR en", vp, ":", e)
+    try:
+        results.append(process_one(vp, out_root))
+    except Exception as e:
+        import traceback
+        print("ERROR en", vp, ":", e)
+        traceback.print_exc()
 
 from google.colab import files
 for out_video, srt_path, json_path, dub_path in results:
     files.download(str(srt_path))
     files.download(str(out_video))
     files.download(str(json_path))
-print(f"Listo v4: {len(results)} video(s) procesados")
+print(f"Listo v4.1: {len(results)} video(s) procesados")

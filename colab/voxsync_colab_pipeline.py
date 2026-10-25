@@ -1,15 +1,17 @@
-# VoxSync Colab pipeline v4.1
-# Fixes: pyannote token= + nest_asyncio for Colab
+# VoxSync Colab pipeline v5
+# Faster-Whisper + checkpoint/resume + soft subs + MODE fast/quality
+# nest_asyncio + pyannote token= fix
 
 YOUTUBE_URL = ""
 INPUT_FOLDER = ""
 SOURCE_LANG = "en"
 TARGET_LANG = "es"
 WHISPER_MODEL = "small"
-
+MODE = "quality"
 DUB_AUDIO = True
 KEEP_BACKGROUND = True
 BURN_SUBTITLES = False
+EMBED_SOFT_SUBS = True
 DUCK_BACKGROUND = 0.30
 TTS_GAIN = 0.95
 CROSSFADE_MS = 45
@@ -17,6 +19,8 @@ USE_DIARIZATION = True
 MERGE_SAME_SPEAKER = True
 MERGE_MAX_GAP = 0.45
 MERGE_MAX_CHARS = 280
+USE_FASTER_WHISPER = True
+RESUME = True
 
 VOICE_POOL = {
     "adult_female": ["es-MX-DaliaNeural", "es-ES-ElviraNeural", "es-AR-ElenaNeural"],
@@ -26,9 +30,15 @@ VOICE_POOL = {
     "child": ["es-MX-DaliaNeural"],
 }
 
-import os, subprocess, sys, shutil, asyncio
+if MODE == "fast":
+    KEEP_BACKGROUND = False
+    USE_DIARIZATION = False
+    if WHISPER_MODEL not in ("tiny", "base"):
+        WHISPER_MODEL = "base"
+
+import os, subprocess, sys, shutil, asyncio, pickle
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-    "openai-whisper", "yt-dlp", "transformers>=4.40,<5", "sentencepiece",
+    "openai-whisper", "faster-whisper", "yt-dlp", "transformers>=4.40,<5", "sentencepiece",
     "sacremoses", "edge-tts", "librosa", "soundfile", "demucs", "nest_asyncio"])
 if USE_DIARIZATION:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pyannote.audio"])
@@ -38,7 +48,7 @@ import nest_asyncio
 nest_asyncio.apply()
 
 from pathlib import Path
-import numpy as np, json as _json, whisper, torch, librosa, soundfile as sf, edge_tts
+import numpy as np, json as _json, torch, librosa, soundfile as sf, edge_tts
 from collections import Counter, defaultdict
 from transformers import MarianMTModel, MarianTokenizer
 
@@ -71,8 +81,24 @@ def get_video_list():
         paths.append(p)
     return paths
 
-print("Cargando Whisper:", WHISPER_MODEL)
-whisper_model = whisper.load_model(WHISPER_MODEL)
+print("Cargando Whisper:", WHISPER_MODEL, "| MODE=", MODE)
+fw_model = None
+openai_model = None
+if USE_FASTER_WHISPER:
+    try:
+        from faster_whisper import WhisperModel
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        fw_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+        print("  faster-whisper OK")
+    except Exception as e:
+        print("  faster-whisper fallo, uso openai-whisper:", e)
+        import whisper
+        openai_model = whisper.load_model(WHISPER_MODEL)
+else:
+    import whisper
+    openai_model = whisper.load_model(WHISPER_MODEL)
+
 model_name = "Helsinki-NLP/opus-mt-es-en" if SOURCE_LANG == "es" and TARGET_LANG == "en" else "Helsinki-NLP/opus-mt-en-es"
 tokenizer = MarianTokenizer.from_pretrained(model_name)
 mt_model = MarianMTModel.from_pretrained(model_name)
@@ -86,6 +112,13 @@ def translate_batch(texts, max_length=256):
     with torch.no_grad():
         outputs = mt_model.generate(**inputs, max_length=max_length)
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+def transcribe(path_16k):
+    if fw_model is not None:
+        segs, info = fw_model.transcribe(str(path_16k), language=SOURCE_LANG or None, vad_filter=True)
+        return [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]
+    result = openai_model.transcribe(str(path_16k), language=SOURCE_LANG or None, verbose=False)
+    return result["segments"]
 
 def run_diarization(wav_path):
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -199,81 +232,111 @@ def run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
+def save_ckpt(path, obj):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+def load_ckpt(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
 def process_one(video_path, out_root):
     video_path = Path(video_path)
     print("\n==========", video_path.name, "==========")
     ep_dir = out_root / video_path.stem
     ep_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = ep_dir / "segments.pkl"
     audio_path = ep_dir / "audio.wav"
     audio_16k = ep_dir / "audio_16k.wav"
-    subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
-                    "-ar", "44100", "-ac", "2", str(audio_path)], check=True, capture_output=True)
-    subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000",
-                    str(audio_16k)], check=True, capture_output=True)
-    result = whisper_model.transcribe(str(audio_16k), language=SOURCE_LANG or None, verbose=False)
-    segments = result["segments"]
-    print("  segmentos:", len(segments))
-    diar_turns = run_diarization(audio_16k) if USE_DIARIZATION else None
-    for seg in segments:
-        seg["speaker"] = assign_speaker(seg, diar_turns)
-    texts = [(s.get("text") or "").strip() for s in segments]
-    translations = list(texts) if SOURCE_LANG == TARGET_LANG else []
-    if SOURCE_LANG != TARGET_LANG:
-        for i in range(0, len(texts), 16):
-            batch = texts[i:i+16]
-            out = translate_batch(batch)
-            for j, t in enumerate(batch):
-                translations.append(out[j] if t else "")
-            print(f"  trad {min(i+16, len(texts))}/{len(texts)}")
-    for seg, tr in zip(segments, translations):
-        seg["translation"] = tr
-    y16, sr16 = librosa.load(str(audio_16k), sr=16000)
-    for seg in segments:
-        lab, med = classify_voice(y16, sr16, seg["start"], seg["end"])
-        seg["voice_type_raw"], seg["pitch_hz"] = lab, med
-    speaker_types = defaultdict(list)
-    for seg in segments:
-        speaker_types[seg["speaker"]].append(seg["voice_type_raw"])
-    speaker_voice, used = {}, set()
-    for spk, types in speaker_types.items():
-        vtype = Counter(types).most_common(1)[0][0]
-        pool = list(VOICE_POOL.get(vtype, VOICE_POOL["adult_male"]))
-        choice = next((v for v in pool if v not in used), pool[0])
-        used.add(choice)
-        speaker_voice[spk] = {"voice_type": vtype, "tts_voice": choice}
-        print(f"  {spk} -> {vtype} -> {choice}")
-    for seg in segments:
-        info = speaker_voice[seg["speaker"]]
-        seg["voice_type"], seg["tts_voice"] = info["voice_type"], info["tts_voice"]
-    if MERGE_SAME_SPEAKER:
-        segments = merge_same_speaker(segments)
     bg_path = ep_dir / "background.wav"
+    tts_dir = ep_dir / "tts_segs"
+    tts_dir.mkdir(exist_ok=True)
+
+    if not audio_path.exists() or not audio_16k.exists():
+        subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
+                        "-ar", "44100", "-ac", "2", str(audio_path)], check=True, capture_output=True)
+        subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000",
+                        str(audio_16k)], check=True, capture_output=True)
+
+    if RESUME and ckpt.exists():
+        print("  Reanudando desde checkpoint segments.pkl")
+        data = load_ckpt(ckpt)
+        segments = data["segments"]
+        speaker_voice = data.get("speaker_voice", {})
+    else:
+        print("  Transcribiendo...")
+        segments = transcribe(audio_16k)
+        print("  segmentos:", len(segments))
+        diar_turns = run_diarization(audio_16k) if USE_DIARIZATION else None
+        for seg in segments:
+            seg["speaker"] = assign_speaker(seg, diar_turns)
+        texts = [(s.get("text") or "").strip() for s in segments]
+        translations = list(texts) if SOURCE_LANG == TARGET_LANG else []
+        if SOURCE_LANG != TARGET_LANG:
+            for i in range(0, len(texts), 16):
+                batch = texts[i:i+16]
+                out = translate_batch(batch)
+                for j, t in enumerate(batch):
+                    translations.append(out[j] if t else "")
+                print(f"  trad {min(i+16, len(texts))}/{len(texts)}")
+        for seg, tr in zip(segments, translations):
+            seg["translation"] = tr
+        y16, sr16 = librosa.load(str(audio_16k), sr=16000)
+        for seg in segments:
+            lab, med = classify_voice(y16, sr16, seg["start"], seg["end"])
+            seg["voice_type_raw"], seg["pitch_hz"] = lab, med
+        speaker_types = defaultdict(list)
+        for seg in segments:
+            speaker_types[seg["speaker"]].append(seg["voice_type_raw"])
+        speaker_voice, used = {}, set()
+        for spk, types in speaker_types.items():
+            vtype = Counter(types).most_common(1)[0][0]
+            pool = list(VOICE_POOL.get(vtype, VOICE_POOL["adult_male"]))
+            choice = next((v for v in pool if v not in used), pool[0])
+            used.add(choice)
+            speaker_voice[spk] = {"voice_type": vtype, "tts_voice": choice}
+            print(f"  {spk} -> {vtype} -> {choice}")
+        for seg in segments:
+            info = speaker_voice[seg["speaker"]]
+            seg["voice_type"], seg["tts_voice"] = info["voice_type"], info["tts_voice"]
+        if MERGE_SAME_SPEAKER:
+            segments = merge_same_speaker(segments)
+        save_ckpt(ckpt, {"segments": segments, "speaker_voice": speaker_voice})
+        print("  Checkpoint guardado")
+
     if DUB_AUDIO and KEEP_BACKGROUND:
-        print("  Demucs...")
-        demucs_out = ep_dir / "demucs_out"
-        if demucs_out.exists(): shutil.rmtree(demucs_out)
-        subprocess.run(["python", "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs",
-                        "-o", str(demucs_out), str(audio_path)], check=True)
-        found_bg = list(demucs_out.rglob("no_vocals.wav"))
-        if not found_bg: raise RuntimeError("Demucs fallo")
-        shutil.copy(found_bg[0], bg_path)
-        print("  Fondo OK")
+        if RESUME and bg_path.exists():
+            print("  Fondo Demucs (cache)")
+        else:
+            print("  Demucs...")
+            demucs_out = ep_dir / "demucs_out"
+            if demucs_out.exists(): shutil.rmtree(demucs_out)
+            subprocess.run(["python", "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs",
+                            "-o", str(demucs_out), str(audio_path)], check=True)
+            found_bg = list(demucs_out.rglob("no_vocals.wav"))
+            if not found_bg: raise RuntimeError("Demucs fallo")
+            shutil.copy(found_bg[0], bg_path)
+            print("  Fondo OK")
     elif DUB_AUDIO:
-        probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
-                                str(video_path)], capture_output=True, text=True, check=True)
-        duration = float(_json.loads(probe.stdout)["format"]["duration"])
-        sf.write(str(bg_path), np.zeros((int(duration * 44100), 2), dtype=np.float32), 44100)
-    dub_path = None
+        if not bg_path.exists():
+            probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+                                    str(video_path)], capture_output=True, text=True, check=True)
+            duration = float(_json.loads(probe.stdout)["format"]["duration"])
+            sf.write(str(bg_path), np.zeros((int(duration * 44100), 2), dtype=np.float32), 44100)
+
+    dub_path = ep_dir / "audio_doblado.wav"
     if DUB_AUDIO:
-        tts_dir = ep_dir / "tts_segs"; tts_dir.mkdir(exist_ok=True)
-        print("  TTS...")
+        print("  TTS (solo faltantes)...")
         async def run_tts():
             for i, seg in enumerate(segments):
+                wav_fit = tts_dir / f"seg_{i:04d}_fit.wav"
+                if RESUME and wav_fit.exists():
+                    seg["tts_fit"] = str(wav_fit)
+                    continue
                 voice = seg.get("tts_voice") or VOICE_POOL["adult_male"][0]
                 pitch, rate = pitch_rate_for(seg.get("voice_type", "adult_male"))
                 mp3 = tts_dir / f"seg_{i:04d}.mp3"
                 wav_raw = tts_dir / f"seg_{i:04d}_raw.wav"
-                wav_fit = tts_dir / f"seg_{i:04d}_fit.wav"
                 ok = await synth_one(seg.get("translation") or seg.get("text"), mp3, voice, rate, pitch)
                 if not ok:
                     seg["tts_fit"] = None
@@ -285,6 +348,7 @@ def process_one(video_path, out_root):
                 if (i + 1) % 10 == 0:
                     print(f"  TTS {i+1}/{len(segments)}")
         run_async(run_tts())
+
         bg, sr = sf.read(str(bg_path))
         if bg.ndim == 1: bg = np.stack([bg, bg], axis=1)
         mix = bg.astype(np.float32).copy()
@@ -303,9 +367,9 @@ def process_one(video_path, out_root):
             mix[start:end] += stereo * float(TTS_GAIN)
         peak = np.max(np.abs(mix)) + 1e-8
         if peak > 0.99: mix *= 0.99 / peak
-        dub_path = ep_dir / "audio_doblado.wav"
         sf.write(str(dub_path), mix, sr)
         print("  Audio doblado OK")
+
     base = video_path.stem
     srt_path = ep_dir / f"{base}.es.srt"
     with open(srt_path, "w", encoding="utf-8") as f:
@@ -314,28 +378,46 @@ def process_one(video_path, out_root):
             f.write(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n[{seg.get('speaker','')}] {text}\n\n")
     json_path = ep_dir / f"{base}.meta.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        _json.dump({"speakers": speaker_voice, "segments": [
+        _json.dump({"speakers": speaker_voice, "mode": MODE, "segments": [
             {"start": s["start"], "end": s["end"], "speaker": s.get("speaker"),
              "text": s.get("text"), "translation": s.get("translation"),
              "voice_type": s.get("voice_type"), "tts_voice": s.get("tts_voice")}
             for s in segments]}, f, ensure_ascii=False, indent=2)
+
     out_video = ep_dir / f"{base}_ES_DOBLADO.mp4"
-    audio_input = str(dub_path) if dub_path else str(audio_path)
+    audio_input = str(dub_path) if (DUB_AUDIO and Path(dub_path).exists()) else str(audio_path)
+
     if BURN_SUBTITLES:
         srt_esc = str(srt_path).replace("\\", "/").replace(":", "\\:")
-        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input, "-map", "0:v:0", "-map", "1:a:0",
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input,
+               "-map", "0:v:0", "-map", "1:a:0",
                "-vf", f"subtitles={srt_esc}:force_style='FontSize=18,Outline=1'",
-               "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
+               "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
+    elif EMBED_SOFT_SUBS:
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input, "-i", str(srt_path),
+               "-map", "0:v:0", "-map", "1:a:0", "-map", "2",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-c:s", "mov_text", "-metadata:s:s:0", "language=spa",
+               "-shortest", str(out_video)]
     else:
-        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input, "-map", "0:v:0", "-map", "1:a:0",
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input,
+               "-map", "0:v:0", "-map", "1:a:0",
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
     print("  Renderizando video...")
-    subprocess.run(cmd, check=True, capture_output=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("  Soft-subs fallo, reintento sin pista de subtitulos...")
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", audio_input,
+               "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
+        subprocess.run(cmd, check=True, capture_output=True)
     print("  OK:", out_video)
-    return out_video, srt_path, json_path, dub_path
+    return out_video, srt_path, json_path, dub_path if DUB_AUDIO else None
 
 videos = get_video_list()
-out_root = work / "output"; out_root.mkdir(exist_ok=True)
+out_root = work / "output"
+out_root.mkdir(exist_ok=True)
 results = []
 for vp in videos:
     try:
@@ -346,8 +428,9 @@ for vp in videos:
         traceback.print_exc()
 
 from google.colab import files
-for out_video, srt_path, json_path, dub_path in results:
+for item in results:
+    out_video, srt_path, json_path, dub_path = item
     files.download(str(srt_path))
     files.download(str(out_video))
     files.download(str(json_path))
-print(f"Listo v4.1: {len(results)} video(s) procesados")
+print(f"Listo v5: {len(results)} video(s) | MODE={MODE}")

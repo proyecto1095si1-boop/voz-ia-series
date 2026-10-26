@@ -1,6 +1,6 @@
-# VoxSync Colab pipeline v5
-# Faster-Whisper + checkpoint/resume + soft subs + MODE fast/quality
-# nest_asyncio + pyannote token= fix
+# VoxSync Colab pipeline v5.1
+# Solo entrega el VIDEO final (sin SRT/JSON/audio aparte)
+# Faster-Whisper + resume + soft subs + MODE + nest_asyncio
 
 YOUTUBE_URL = ""
 INPUT_FOLDER = ""
@@ -376,13 +376,6 @@ def process_one(video_path, out_root):
         for i, seg in enumerate(segments, 1):
             text = (seg.get("translation") or seg["text"]).strip()
             f.write(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n[{seg.get('speaker','')}] {text}\n\n")
-    json_path = ep_dir / f"{base}.meta.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        _json.dump({"speakers": speaker_voice, "mode": MODE, "segments": [
-            {"start": s["start"], "end": s["end"], "speaker": s.get("speaker"),
-             "text": s.get("text"), "translation": s.get("translation"),
-             "voice_type": s.get("voice_type"), "tts_voice": s.get("tts_voice")}
-            for s in segments]}, f, ensure_ascii=False, indent=2)
 
     out_video = ep_dir / f"{base}_ES_DOBLADO.mp4"
     audio_input = str(dub_path) if (DUB_AUDIO and Path(dub_path).exists()) else str(audio_path)
@@ -413,7 +406,7 @@ def process_one(video_path, out_root):
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video)]
         subprocess.run(cmd, check=True, capture_output=True)
     print("  OK:", out_video)
-    return out_video, srt_path, json_path, dub_path if DUB_AUDIO else None
+    return out_video
 
 videos = get_video_list()
 out_root = work / "output"
@@ -428,9 +421,6 @@ for vp in videos:
         traceback.print_exc()
 
 from google.colab import files
-for item in results:
-    out_video, srt_path, json_path, dub_path = item
-    files.download(str(srt_path))
+for out_video in results:
     files.download(str(out_video))
-    files.download(str(json_path))
-print(f"Listo v5: {len(results)} video(s) | MODE={MODE}")
+print(f"Listo: {len(results)} video(s) descargado(s)")
